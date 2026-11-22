@@ -40,7 +40,7 @@ test('I²C streaming preserves panels, readings, availability and power units', 
   const browser = spawn(chrome, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', '--disable-background-networking', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
   t.after(async () => {
     if (browser.exitCode === null) { browser.kill(); await once(browser, 'exit'); }
-    await rm(profile, { recursive: true, force: true });
+    // Chrome helpers can still flush files briefly after the browser exits.\n    // Retry only the transient filesystem removal errors rather than ignoring cleanup failures.\n    await rm(profile, { recursive: true, force: true, maxRetries: 12, retryDelay: 200 });
   });
   let stderr = '';
   const wsUrl = await new Promise((resolve, reject) => {
