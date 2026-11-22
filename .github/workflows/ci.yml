@@ -1,0 +1,61 @@
+name: Portfolio CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  software-tests:
+    name: Node.js and digital twin tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: telemetry-bridge/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci --prefix telemetry-bridge
+
+      - name: Test telemetry bridge and backend
+        run: npm test --prefix telemetry-bridge
+
+      - name: Test link characterization tools
+        run: npm test --prefix tools/link-tools
+
+      - name: Test digital twin and dashboard integration
+        run: node --test tests/twin/*.test.mjs
+
+  portable-c-tests:
+    name: Portable C firmware checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compile and test peripheral sensor conversions
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I main \
+            main/peripheral_sensor_math.c test/peripheral_sensor_math_test.c \
+            -lm -o /tmp/orbital-peripheral-test
+          /tmp/orbital-peripheral-test
+
+      - name: Compile and test telemetry packet encoding
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I test/stubs -I pass -I main \
+            pass/telemetry_packet_v3.c pass/telemetry_packet_v4.c \
+            test/telemetry_packet_v4_test.c -o /tmp/orbital-packet-test
+          /tmp/orbital-packet-test
