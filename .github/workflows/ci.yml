@@ -59,3 +59,39 @@ jobs:
             pass/telemetry_packet_v3.c pass/telemetry_packet_v4.c \
             test/telemetry_packet_v4_test.c -o /tmp/orbital-packet-test
           /tmp/orbital-packet-test
+
+  publish-portfolio-release:
+    name: Publish v1.0.0 after green checks
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: [software-tests, portable-c-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out verified commit
+        uses: actions/checkout@v4
+
+      - name: Check whether the release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v1.0.0 already exists; skipping publication."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish verified portfolio release
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Orbital Address v1.0.0 — Portfolio Demo" \
+            --notes-file docs/RELEASE_NOTES_v1.0.0.md \
+            --latest
