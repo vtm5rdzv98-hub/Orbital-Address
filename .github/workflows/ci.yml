@@ -35,6 +35,9 @@ jobs:
       - name: Test link characterization tools
         run: npm test --prefix tools/link-tools
 
+      - name: Prepare pinned Three.js vendor build
+        run: bash tools/prepare-three.sh
+
       - name: Test digital twin and dashboard integration
         run: node --test tests/twin/*.test.mjs
 
