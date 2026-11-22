@@ -1,10 +1,12 @@
 # Orbital Address
 
+[![Portfolio CI](https://github.com/vtm5rdzv98-hub/Orbital-Address/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vtm5rdzv98-hub/Orbital-Address/actions/workflows/ci.yml)
+
 **Real-time telemetry, diagnostics, and operator controls for the KnightEPS CubeSat electrical power system.**
 
 Orbital Address is the ground-side software platform for **KnightEPS**, a University of Central Florida senior design project centered on a solar-assisted CubeSat electrical power system (EPS) prototype. It connects embedded power-system measurements to a web interface for monitoring, recording, troubleshooting, and authorized bench control.
 
-**[Live website](https://orbitaladdress.com/#home)** · **[Dashboard](https://orbitaladdress.com/#dashboard)** · **[Project video](https://youtu.be/O13I94AdMXs)** · **[Run the local demo](#run-locally)** · **[Explore the architecture](#architecture)**
+**[Live website](https://orbitaladdress.com/#home)** · **[Dashboard](https://orbitaladdress.com/#dashboard)** · **[Project video](https://youtu.be/O13I94AdMXs)** · **[v1.0.0 release](https://github.com/vtm5rdzv98-hub/Orbital-Address/releases/tag/v1.0.0)** · **[Run the local demo](#run-locally)** · **[Explore the architecture](#architecture)**
 
 ![Orbital Address I²C telemetry dashboard showing synthetic sensor measurements](docs/dashboard-demo.jpg)
 
