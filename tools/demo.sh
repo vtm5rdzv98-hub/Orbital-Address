@@ -18,6 +18,9 @@ if [[ ! -d telemetry-bridge/node_modules/jose ]]; then
   exit 1
 fi
 
+# Supply the pinned Three.js browser runtime excluded from source control.
+bash tools/prepare-three.sh
+
 site_url=http://127.0.0.1:8090
 bridge_url=http://127.0.0.1:8080
 state=$(mktemp -d /tmp/orbital-address-demo.XXXXXXXX)
