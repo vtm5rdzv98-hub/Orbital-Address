@@ -4,6 +4,7 @@
 // node synth_sender.mjs --target 127.0.0.1:3333 --count 60 --period 1000 [--v5 | --debug/--v6]
 //   --present all|none|pv,bms,mppt   which I2C devices exist (debug firmware emulation; default all)
 //   --count 0  run until SIGINT/SIGTERM
+//   --bind 127.0.0.1 --source-port 3341  use a fixed local UDP endpoint
 //   --drop 5,6,20   drop these seqs     --loss-pct 2   random loss (seeded)   --dup 10   send seq 10 twice
 //   --reorder 30    swap seq 30 with 31  --jitter-ms 30 uniform send jitter     --start-seq 1  --seed 1
 //   --wiggle  vary measurement values (demo)   --reboot-at 40  restart seq at 1 after this seq   --cmd-delay-ms 20   --cmd-drop-pct 0   --linger-ms 1500
@@ -105,7 +106,7 @@ function wiggle(hex, seq) {
 
 let stop = false;
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { stop = true; });
-sock.bind({ port: 0, address: a.bind || '0.0.0.0' }, async () => {
+sock.bind({ port: Number(a['source-port'] || 0), address: a.bind || '0.0.0.0' }, async () => {
   let seq = Number(a['start-seq'] || 1); let held = null;
   for (let i = 0; (count === 0 || i < count) && !stop; i++) {
     const cur = seq; seq = seq >= 65535 ? 1 : seq + 1;

@@ -10,21 +10,22 @@ Orbital Address is the ground-side software for **KnightEPS**, a University of C
 
 ## Run the demo
 
-Use Node.js 22 or 24, npm, Bash, and curl. From the repository root:
+Use Node.js 22 or 24, npm, and Bash. From the repository root:
 
 ```sh
 npm ci --prefix telemetry-bridge
-bash tools/demo.sh
+bash tools/demo.sh --operator
 ```
 
-Open [the local dashboard](http://127.0.0.1:8090), select **Dashboard**, and sign in with the `reviewer` username and the password printed in your terminal. These credentials expire when the demo stops. Press **Ctrl+C** to stop it.
+Open the local dashboard, select **Dashboard**, and use the temporary credentials printed in your terminal. Press **Ctrl+C** to stop the demo, expire its credentials, and delete its local run history. [Open the local dashboard](http://127.0.0.1:8090)
 
-- **I²C Telemetry** shows simulated solar input, battery cells, charger state, and environmental sensors.
-- **Network Statistics** plots packet timing, loss, and link quality from the simulated UDP stream.
-- **Digital Twin** lets you orbit, explode, and inspect the prototype in 3D, with a simulated telemetry display.
-- **Logged Telemetry** shows the run browser. The viewer demo starts with an empty history.
+- **Programming** scans the simulated I²C bus and reads registers through the authenticated command path.
+- **Branch Definition** comes with an INA226 bench check. Simulate its conditional logic, then execute it against the UDP device simulator and inspect the command acknowledgments and branch decision.
+- **Logged Telemetry** links the completed sequence to its recorded telemetry and event timeline.
 
-The demo works without hardware or cloud credentials. It binds to loopback, uses the real viewer login, and feeds synthetic packets through the same bridge decoder as the firmware. Hardware commands require an operator session and separate credentials.
+The operator demo uses the real session, command-token, and execution-confirmation flow. The bridge, browser server, and simulator bind to loopback, and command dispatch targets the simulator's dedicated local UDP port. [Walk through Programming and Branch Definition](docs/operator-demo.md)
+
+Run `bash tools/demo.sh` for the viewer demo. It includes I²C Telemetry, Network Statistics, and the interactive Digital Twin.
 
 ## System overview
 
