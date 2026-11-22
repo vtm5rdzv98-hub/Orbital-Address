@@ -31,7 +31,7 @@ bash tools/demo.sh --operator
 
 Open **http://127.0.0.1:8090**, select Dashboard, and use the temporary credentials printed by the launcher. The operator mode also prints a separate command token. Press Ctrl+C to stop and delete temporary demonstration state.
 
-Read the [operator walkthrough](../docs/operator-demo.md) or the [README](../README.md) for details.
+Read the [operator walkthrough](https://github.com/vtm5rdzv98-hub/Orbital-Address/blob/main/docs/operator-demo.md) or the [README](https://github.com/vtm5rdzv98-hub/Orbital-Address/blob/main/README.md) for details.
 
 ## Verification scope
 
@@ -45,7 +45,7 @@ This release is a portfolio snapshot, **not a claim that this exact commit is de
 
 Orbital Address is the ground-side software for KnightEPS at the University of Central Florida. Itzjac Lechtman developed cloud and GUI portions; Jaden Adkins worked on firmware and MCU telemetry; William Garland contributed power management, battery systems, and PCBs; and Liam Magee contributed MCU hardware, regulators, and PCBs. The integrated prototype was a team effort.
 
-See [LICENSE](../LICENSE) and upstream notices in the repository for source-code licensing. Project imagery and digital-twin assets may have separate reuse considerations.
+See [LICENSE](https://github.com/vtm5rdzv98-hub/Orbital-Address/blob/main/LICENSE) and upstream notices in the repository for source-code licensing. Project imagery and digital-twin assets may have separate reuse considerations.
 
 **Live site:** https://orbitaladdress.com/#home
 
