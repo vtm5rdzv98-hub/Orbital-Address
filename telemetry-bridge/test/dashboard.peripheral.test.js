@@ -1,0 +1,147 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import {
+  createMockPeripheralTelemetry,
+  normalizePeripheralTelemetry,
+  peripheralTelemetryForMode
+} from '../../site/assets/js/telemetry-model.mjs';
+
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(testDirectory, '..', '..');
+
+test('mock peripheral telemetry uses the live field names and data types', () => {
+  const values = [0.25, 0.75];
+  const mock = createMockPeripheralTelemetry(() => values.shift());
+
+  assert.equal(typeof mock.temperatureC, 'number');
+  assert.equal(typeof mock.lightVoltageMv, 'number');
+  assert.equal(typeof mock.relativeLightLevel, 'number');
+  assert.equal(mock.temperatureSaturated, false);
+  assert.equal(mock.lightSaturated, false);
+  assert.equal(mock.lightVoltageMv, Math.round(mock.relativeLightLevel * 3100));
+});
+
+test('switching from mock to live clears sensor values instead of retaining simulations', () => {
+  const mock = peripheralTelemetryForMode('mock', () => 0.5);
+  assert.notEqual(mock.temperatureC, null);
+  assert.notEqual(mock.relativeLightLevel, null);
+
+  const liveWaiting = peripheralTelemetryForMode('live');
+  assert.deepEqual(liveWaiting, {
+    temperatureC: null,
+    temperatureSaturated: null,
+    lightVoltageMv: null,
+    lightLevel: null,
+    relativeLightLevel: null,
+    lightSaturated: null
+  });
+
+  const mockAgain = peripheralTelemetryForMode('mock', () => 0.25);
+  assert.notEqual(mockAgain.temperatureC, null);
+  assert.notEqual(mockAgain.relativeLightLevel, null);
+});
+
+test('live packets with missing peripheral fields normalize to unavailable', () => {
+  assert.deepEqual(normalizePeripheralTelemetry({}), peripheralTelemetryForMode('live'));
+  assert.deepEqual(
+    normalizePeripheralTelemetry({ peripheral: { temperatureC: null } }),
+    peripheralTelemetryForMode('live')
+  );
+
+  assert.deepEqual(normalizePeripheralTelemetry({
+    peripheral: {
+      temperatureC: 24.5,
+      temperatureSaturated: false,
+      lightVoltageMv: 1550,
+      relativeLightLevel: 0.5,
+      lightSaturated: true
+    }
+  }), {
+    temperatureC: 24.5,
+    temperatureSaturated: false,
+    lightVoltageMv: 1550,
+    lightLevel: 'Bright',
+    relativeLightLevel: 0.5,
+    lightSaturated: true
+  });
+});
+
+test('active dashboard contains and drives both peripheral sensor components', async () => {
+  const html = await readFile(
+    path.join(repositoryRoot, 'site/modules/communication.html'),
+    'utf8'
+  );
+  const script = await readFile(
+    path.join(repositoryRoot, 'site/assets/js/i2c.js'),
+    'utf8'
+  );
+
+  for (const id of [
+    'summaryPeripheralTemp',
+    'summaryRelativeLight',
+    'peripheralTemperatureValue',
+    'peripheralTemperatureStatus',
+    'relativeLightValue',
+    'lightVoltageValue'
+  ]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`));
+    assert.match(script, new RegExp(id));
+  }
+
+  assert.match(html, /It is not a lux measurement/);
+  assert.match(script, /dataMode = 'live'/);
+  assert.match(script, /dataMode = 'mock'/);
+});
+
+test('production route loads the current communication dashboard assets', async () => {
+  const [index, app, router] = await Promise.all([
+    readFile(path.join(repositoryRoot, 'site/index.html'), 'utf8'),
+    readFile(path.join(repositoryRoot, 'site/assets/js/app.js'), 'utf8'),
+    readFile(path.join(repositoryRoot, 'site/assets/js/router.js'), 'utf8')
+  ]);
+
+  // Versions change when assets are edited. Verify the actual versioned load
+  // chain and files instead of pinning unrelated historical release dates.
+  const assets = [
+    [index, /src=["'](\.\/assets\/js\/app\.js\?v=[\w-]+)["']/, 'site/index.html'],
+    [index, /href=["'](\.\/assets\/css\/styles\.css\?v=[\w-]+)["']/, 'site/index.html'],
+    [app, /from\s*["'](\.\/router\.js\?v=[\w-]+)["']/, 'site/assets/js/app.js'],
+    [router, /from\s*["'](\.\/i2c\.js\?v=[\w-]+)["']/, 'site/assets/js/router.js'],
+    [router, /communication:\s*`(\.\/modules\/communication\.html\?v=[\w-]+)`/, 'site/index.html']
+  ];
+  for (const [source, pattern, relativeTo] of assets) {
+    const match = source.match(pattern);
+    assert.ok(match, `Missing versioned asset reference: ${pattern}`);
+    const parent = new URL(`../../${relativeTo}`, import.meta.url);
+    const asset = new URL(match[1], parent);
+    assert.ok((await readFile(asset, 'utf8')).trim(), `Missing or empty asset: ${asset.pathname}`);
+  }
+  assert.match(router, /communication:\s*`\.\/modules\/communication\.html/);
+  assert.match(router, /communication:\s*initI2CPage/);
+  assert.match(router, /route === 'dashboard'\) return 'communication'/);
+  assert.doesNotMatch(router, /dashboard\.js/);
+});
+
+test('browser bridge requests use JWT session and CSRF wrapper while preserving the command token', async () => {
+  const [auth, i2c, debug, link] = await Promise.all([
+    readFile(path.join(repositoryRoot, 'site/assets/js/auth.js'), 'utf8'),
+    readFile(path.join(repositoryRoot, 'site/assets/js/i2c.js'), 'utf8'),
+    readFile(path.join(repositoryRoot, 'site/assets/js/debug-mode.js'), 'utf8'),
+    readFile(path.join(repositoryRoot, 'site/assets/js/link-health.js'), 'utf8')
+  ]);
+
+  assert.match(auth, /credentials:\s*'same-origin'/);
+  assert.match(auth, /headers\.set\('X-CSRF-Token', state\.csrf\)/);
+  assert.match(i2c, /apiFetch\(commandUrl/);
+  assert.match(i2c, /headers\['X-Command-Token'\] = commandToken/);
+  assert.match(i2c, /if \(!canOperate\(\)\)/);
+  assert.match(debug, /apiFetch\(`\$\{url\}/);
+  assert.match(debug, /headers\['X-Command-Token'\] = token\(\)/);
+  assert.match(debug, /canOperate\(\) &&/);
+  assert.match(link, /apiFetch\(url/);
+  for (const script of [i2c, debug, link]) assert.doesNotMatch(script, /await fetch\(/);
+});

@@ -1,0 +1,12 @@
+#pragma once
+
+/* Copy to app_config.h and set values for your own lab network. */
+#define DEMO_WIFI_SSID ""
+#define DEMO_WIFI_PASSWORD ""
+#define DEMO_SERVER_HOST "192.0.2.1"
+#define DEMO_DEVICE_ID "esp32-telemetry"
+
+/* Optional signed UDP telemetry. Use the same private key on the bridge. */
+/* #define DEMO_TELEMETRY_HMAC_KEY "" */
+
+#include "app_config_defaults.h"

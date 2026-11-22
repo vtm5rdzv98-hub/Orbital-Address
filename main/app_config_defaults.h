@@ -1,0 +1,87 @@
+#pragma once
+
+/* Firmware defaults. Override board-specific settings in app_config.h. */
+
+#ifndef DEMO_SERVER_UDP_PORT
+#define DEMO_SERVER_UDP_PORT 3333u
+#endif
+
+#ifndef DEMO_TEMP_OUT_GPIO
+#define DEMO_TEMP_OUT_GPIO 1
+#endif
+
+#ifndef DEMO_LIGHT_OUT_GPIO
+#define DEMO_LIGHT_OUT_GPIO 2
+#endif
+
+#ifndef DEMO_TEMP_OUT_ATTEN
+#define DEMO_TEMP_OUT_ATTEN 2
+#endif
+
+#ifndef DEMO_LIGHT_OUT_ATTEN
+#define DEMO_LIGHT_OUT_ATTEN 3
+#endif
+
+#ifndef DEMO_RGB_LED_GPIO
+#define DEMO_RGB_LED_GPIO 38
+#endif
+
+#ifndef DEMO_RGB_LED_RED
+#define DEMO_RGB_LED_RED 0u
+#endif
+
+#ifndef DEMO_RGB_LED_GREEN
+#define DEMO_RGB_LED_GREEN 24u
+#endif
+
+#ifndef DEMO_RGB_LED_BLUE
+#define DEMO_RGB_LED_BLUE 0u
+#endif
+
+#ifndef DEMO_STREAM_PERIOD_MS
+#define DEMO_STREAM_PERIOD_MS 1000u
+#endif
+
+#ifndef DEMO_ACK_TIMEOUT_MS
+#define DEMO_ACK_TIMEOUT_MS 250u
+#endif
+
+#ifndef DEMO_COMMAND_POLL_SLICE_MS
+#define DEMO_COMMAND_POLL_SLICE_MS 100u
+#endif
+
+#ifndef DEMO_MAX_CONSECUTIVE_ERRORS
+#define DEMO_MAX_CONSECUTIVE_ERRORS 5u
+#endif
+
+#ifndef DEMO_DEBUG_MODE_DEFAULT
+#define DEMO_DEBUG_MODE_DEFAULT 0
+#endif
+
+#ifndef DEMO_PRESENCE_DETECTION
+#define DEMO_PRESENCE_DETECTION 1
+#endif
+
+#ifndef DEMO_PRESENCE_PROBE_PERIOD_MS
+#define DEMO_PRESENCE_PROBE_PERIOD_MS 5000u
+#endif
+
+#ifndef DEMO_SCAN_PERIOD_MIN_MS
+#define DEMO_SCAN_PERIOD_MIN_MS 200u
+#endif
+
+#ifndef DEMO_SCAN_PERIOD_MAX_MS
+#define DEMO_SCAN_PERIOD_MAX_MS 5000u
+#endif
+
+#ifndef DEMO_SEND_ON_I2C_FAILURE
+#define DEMO_SEND_ON_I2C_FAILURE 0
+#endif
+
+#ifndef DEMO_WIFI_BACKOFF_MIN_MS
+#define DEMO_WIFI_BACKOFF_MIN_MS 1000u
+#endif
+
+#ifndef DEMO_WIFI_BACKOFF_MAX_MS
+#define DEMO_WIFI_BACKOFF_MAX_MS 30000u
+#endif

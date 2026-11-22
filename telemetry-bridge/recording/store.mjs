@@ -1,0 +1,466 @@
+import { snapshotSequence, sequenceReferences } from '../sequence/dependencies.mjs';
+import Database from 'better-sqlite3';
+import { registryEntry, existingRegistryEntry } from '../register-registry.mjs';
+import { randomUUID } from 'node:crypto';
+import { confirmedMode, confirmedSource, deviceReboot, packetOrder, transition, SOURCE_LABELS } from './state.mjs';
+
+export const METRICS = Object.freeze({
+  'pv.busVoltageV': '$.packet.telemetry.pv.busVoltageV',
+  'pv.currentA': '$.packet.telemetry.pv.currentA',
+  'pv.powerW': '$.packet.telemetry.pv.powerW',
+  'bms.cell1V': '$.packet.telemetry.bms.cellVoltagesV[0]',
+  'bms.cell2V': '$.packet.telemetry.bms.cellVoltagesV[1]',
+  'bms.cell3V': '$.packet.telemetry.bms.cellVoltagesV[2]',
+  // Fourth slot was physical cell 10 before v6; do not mislabel historical packets.
+  'bms.cellSlot4V': '$.packet.telemetry.bms.cellVoltagesV[3]',
+  'bms.packVoltageV': '$.packet.telemetry.bms.packVoltageV',
+  'mppt.vbusV': '$.packet.telemetry.mppt.vbusV',
+  'mppt.vbatV': '$.packet.telemetry.mppt.vbatV',
+  'mppt.ibusA': '$.packet.telemetry.mppt.ibusA',
+  'peripheral.temperatureC': '$.packet.telemetry.peripheral.temperatureC',
+  'peripheral.lightVoltageMv': '$.packet.telemetry.peripheral.lightVoltageMv'
+});
+
+function fail(message, statusCode = 400) { throw Object.assign(new Error(message), { statusCode }); }
+function integer(value, fallback, min, max) {
+  const n = value === undefined ? fallback : Number(value);
+  if (!Number.isSafeInteger(n) || n < min || n > max) fail(`Expected an integer from ${min} through ${max}`);
+  return n;
+}
+
+export class RunStore {
+  constructor(filename, now = Date.now()) {
+    this.ownerId = randomUUID();
+    this.lastDeviceUptimeMs = null;
+    this.db = new Database(filename);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 2000');
+    if (this.db.pragma('user_version', { simple: true }) > 3) throw new Error('Unsupported recording schema version');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS recorder_owner (singleton INTEGER PRIMARY KEY CHECK(singleton=1), pid INTEGER NOT NULL, token TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, name TEXT NOT NULL,
+        device_id TEXT NOT NULL, remote_address TEXT NOT NULL,
+        run_type TEXT NOT NULL CHECK(run_type IN ('debug','live_telemetry')),
+        current_mode TEXT NOT NULL, current_source TEXT,
+        started_ms INTEGER NOT NULL, ended_ms INTEGER, end_reason TEXT,
+        status TEXT NOT NULL DEFAULT 'recording', contains_debug INTEGER NOT NULL DEFAULT 0,
+        previous_run_id TEXT REFERENCES runs(id), next_run_id TEXT REFERENCES runs(id),
+        sample_count INTEGER NOT NULL DEFAULT 0, last_seq INTEGER,
+        last_received_ms INTEGER, metadata_json TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS one_open_run ON runs(status) WHERE status='recording';
+      CREATE INDEX IF NOT EXISTS runs_started ON runs(started_ms,id);
+      CREATE TABLE IF NOT EXISTS samples (
+        id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+        received_ms INTEGER NOT NULL, seq INTEGER, mode TEXT, power_source TEXT,
+        packet_order TEXT NOT NULL, envelope_json TEXT NOT NULL, raw_base64 TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS samples_window ON samples(run_id,received_ms,id);
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+        at_ms INTEGER NOT NULL, type TEXT NOT NULL, details_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS events_window ON events(run_id,at_ms,id);
+    `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS register_registry (
+        target TEXT PRIMARY KEY, entry_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sequences (
+        id TEXT PRIMARY KEY, revision INTEGER NOT NULL, name TEXT NOT NULL,
+        definition_json TEXT NOT NULL, updated_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sequence_library_order (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL, ids_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sequence_revisions (
+        id TEXT NOT NULL, revision INTEGER NOT NULL, definition_json TEXT NOT NULL,
+        PRIMARY KEY(id,revision)
+      );
+      INSERT OR IGNORE INTO sequence_revisions SELECT id,revision,definition_json FROM sequences;
+      CREATE TABLE IF NOT EXISTS sequence_executions (
+        id TEXT PRIMARY KEY, sequence_id TEXT, revision INTEGER, definition_json TEXT NOT NULL,
+        mode TEXT NOT NULL, operator_name TEXT, recording_session_id TEXT, device_id TEXT,
+        state TEXT NOT NULL, reason TEXT, started_ms INTEGER NOT NULL, ended_ms INTEGER, recovery_ms INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS sequence_events (
+        execution_id TEXT NOT NULL REFERENCES sequence_executions(id),
+        event_order INTEGER NOT NULL, at_ms INTEGER NOT NULL, type TEXT NOT NULL,
+        block_id TEXT, details_json TEXT NOT NULL,
+        PRIMARY KEY(execution_id,event_order)
+      );
+    `);
+    if (this.db.pragma('user_version', { simple: true }) < 3) {
+      this.db.transaction(() => {
+        this.db.exec('ALTER TABLE sequence_executions ADD COLUMN recording_run_id TEXT REFERENCES runs(id)');
+        this.db.pragma('user_version = 3');
+      })();
+    }
+    // Never resume an acquisition silently after a crash/restart.
+    try { this.db.transaction(() => {
+      const owner = this.db.prepare('SELECT pid FROM recorder_owner WHERE singleton=1').get();
+      if (owner) {
+        let alive = true;
+        try { process.kill(owner.pid, 0); } catch (error) { if (error.code === 'ESRCH') alive = false; }
+        if (alive) throw new Error('Another recorder owns this database');
+      }
+      this.db.prepare('INSERT OR REPLACE INTO recorder_owner(singleton,pid,token) VALUES(1,?,?)').run(process.pid, this.ownerId);
+      for (const r of this.db.prepare("SELECT * FROM runs WHERE status='recording'").all()) {
+        this.finish(r, now, 'bridge_restart', 'interrupted');
+      }
+      for (const row of this.db.prepare("SELECT id FROM sequence_executions WHERE state IN ('idle','running','paused')").all()) {
+        this.db.prepare("UPDATE sequence_executions SET state='failed',reason='bridge_restart',ended_ms=? WHERE id=?").run(now, row.id);
+        this.sequenceEvent({ execution_id: row.id, order: this.nextSequenceOrder(row.id), at_ms: now,
+          type: 'state', block_id: null, details: { state: 'failed', reason: 'bridge_restart' } });
+      }
+    })(); } catch (error) { this.db.close(); throw error; }
+  }
+  active() { return this.db.prepare("SELECT * FROM runs WHERE status='recording'").get() || null; }
+  nextSequenceOrder(id) {
+    return this.db.prepare('SELECT COALESCE(MAX(event_order),0)+1 AS next FROM sequence_events WHERE execution_id=?').get(id).next;
+  }
+  registerList() {
+    return this.db.prepare('SELECT entry_json FROM register_registry ORDER BY target').all().map((row) => JSON.parse(row.entry_json));
+  }
+  registerAdd(input) {
+    const entry = registryEntry(input);
+    return this.db.transaction(() => {
+      const list = this.registerList();
+      const existing = existingRegistryEntry(entry, list);
+      if (existing) return existing;
+      if (list.length >= 1024) fail('Register registry is full', 409);
+      this.db.prepare('INSERT INTO register_registry(target,entry_json) VALUES(?,?)')
+        .run(`${entry.addr}:${entry.reg}`, JSON.stringify(entry));
+      return entry;
+    })();
+  }
+  sequenceSave({ definition, expectedRevision = null, now = Date.now() }) {
+    return this.db.transaction(() => {
+      this.sequenceLibrary();
+      const existing = this.db.prepare('SELECT revision FROM sequences WHERE id=?').get(definition.id);
+      if (existing && existing.revision !== expectedRevision) fail('Sequence revision conflict', 409);
+      if (!existing && expectedRevision !== null) fail('Sequence does not exist', 404);
+      const previous = this.db.prepare('SELECT MAX(revision) AS revision FROM sequence_revisions WHERE id=?').get(definition.id).revision || 0;
+      const saved = { ...definition, revision: previous + 1 };
+      this.sequenceSnapshot({ definition: saved });
+      this.db.prepare('INSERT INTO sequences(id,revision,name,definition_json,updated_ms) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,name=excluded.name,definition_json=excluded.definition_json,updated_ms=excluded.updated_ms')
+        .run(saved.id, saved.revision, saved.name, JSON.stringify(saved), now);
+      this.db.prepare('INSERT INTO sequence_revisions(id,revision,definition_json) VALUES(?,?,?)').run(saved.id, saved.revision, JSON.stringify(saved));
+      this.sequenceLibrary();
+      return saved;
+    })();
+  }
+  sequenceGet({ id, revision }) {
+    const row = revision === undefined ? this.db.prepare('SELECT definition_json FROM sequences WHERE id=?').get(id)
+      : this.db.prepare('SELECT definition_json FROM sequence_revisions WHERE id=? AND revision=?').get(id, revision);
+    if (!row) fail('Sequence revision not found', 404);
+    return JSON.parse(row.definition_json);
+  }
+  sequenceSnapshot({ id, definition }) {
+    try { return snapshotSequence(definition || this.sequenceGet({ id }), (id, revision) => this.sequenceGet({ id, revision })); }
+    catch (error) { if (error.statusCode) throw error; fail(error.message, 400); }
+  }
+  sequenceDelete({ id, expectedRevision }) {
+    return this.db.transaction(() => {
+      const target = this.sequenceGet({ id });
+      if (!Number.isSafeInteger(expectedRevision) || target.revision !== expectedRevision) fail('Sequence revision conflict', 409);
+      for (const row of this.db.prepare('SELECT definition_json FROM sequences WHERE id<>?').all(id)) {
+        const definition = JSON.parse(row.definition_json);
+        const graph = this.sequenceSnapshot({ definition });
+        if ([definition, ...graph.dependencies].some((item) => sequenceReferences(item.steps).some((ref) => ref.sequenceId === id))) fail(`Referenced by saved Branch Definition "${definition.name}" revision ${definition.revision}`, 409);
+      }
+      this.sequenceLibrary();
+      this.db.prepare('DELETE FROM sequences WHERE id=? AND revision=?').run(id, expectedRevision);
+      this.sequenceLibrary();
+      return { id, revision: target.revision };
+    })();
+  }
+  sequenceList() {
+    return this.sequenceLibrary().sequences;
+  }
+  // Library presentation metadata never touches revisions, references or executions.
+  sequenceLibrary() {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare('SELECT id,revision,name,updated_ms FROM sequences ORDER BY updated_ms DESC,id').all();
+      const metadata = this.db.prepare('SELECT version,ids_json FROM sequence_library_order WHERE singleton=1').get();
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      const oldIds = metadata ? JSON.parse(metadata.ids_json) : [];
+      const ids = oldIds.filter((id) => byId.has(id));
+      const included = new Set(ids);
+      ids.push(...rows.filter((row) => !included.has(row.id)).map((row) => row.id));
+      const changed = JSON.stringify(ids) !== JSON.stringify(oldIds);
+      const version = metadata ? metadata.version + Number(changed) : 1;
+      if (!metadata || changed) this.db.prepare('INSERT INTO sequence_library_order VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,ids_json=excluded.ids_json').run(version, JSON.stringify(ids));
+      return { sequences: ids.map((id) => byId.get(id)), order: { version, ids } };
+    })();
+  }
+  sequenceMove({ id, before_id, expected_version }) {
+    if (typeof id !== 'string' || !(before_id === null || typeof before_id === 'string') || !Number.isSafeInteger(expected_version) || expected_version < 1) fail('Invalid library order move');
+    return this.db.transaction(() => {
+      const { order } = this.sequenceLibrary();
+      if (expected_version !== order.version) fail('Library order changed elsewhere. Review the refreshed list and retry your move.', 409);
+      if (!order.ids.includes(id) || before_id !== null && !order.ids.includes(before_id)) fail('A definition in this move was deleted. Choose a new position.', 409);
+      if (id === before_id) return this.sequenceLibrary();
+      const ids = order.ids.filter((value) => value !== id);
+      ids.splice(before_id === null ? ids.length : ids.indexOf(before_id), 0, id);
+      if (JSON.stringify(ids) !== JSON.stringify(order.ids)) this.db.prepare('UPDATE sequence_library_order SET version=?,ids_json=? WHERE singleton=1').run(order.version + 1, JSON.stringify(ids));
+      return this.sequenceLibrary();
+    })();
+  }
+  sequenceStart({ id, definition, mode, operator_name, recording_session_id, device_id, started_ms }) {
+    this.db.prepare('INSERT INTO sequence_executions(id,sequence_id,revision,definition_json,mode,operator_name,recording_session_id,device_id,state,started_ms) VALUES(?,?,?,?,?,?,?,?,?,?)')
+      .run(id, definition.id || null, definition.revision || null, JSON.stringify(definition), mode, operator_name, recording_session_id, device_id, 'running', started_ms);
+    return this.sequenceGetExecution({ id });
+  }
+  sequenceStartLive({ envelope, metadata, ...execution }) {
+    return this.db.transaction(() => {
+      const active = this.active();
+      if (active && (active.device_id !== envelope?.packet?.device_id || active.remote_address !== envelope?.network?.remote_address)) fail('Recording belongs to another telemetry source', 409);
+      const run = active || this.start({ name: execution.definition.name, envelope, metadata: { ...metadata, sequence_execution_id: execution.id }, now: execution.started_ms });
+      this.sequenceStart({ ...execution, recording_session_id: run.session_id });
+      this.db.prepare('UPDATE sequence_executions SET recording_run_id=? WHERE id=?').run(run.id, execution.id);
+      return { execution: this.sequenceGetExecution({ id: execution.id }), run, owns_recording: !active };
+    })();
+  }
+  sequenceFinishRecording({ session_id, reason, status }) {
+    const active = this.active();
+    // A sequence may only close the session it created, including its linked segments.
+    return active?.session_id === session_id ? this.stop({ reason, status }) : null;
+  }
+  sequenceState({ id, state, reason, ended_ms }) {
+    const result = this.db.prepare("UPDATE sequence_executions SET state=?,reason=?,ended_ms=COALESCE(?,ended_ms) WHERE id=? AND state NOT IN ('completed','failed','canceled')").run(state, reason, ended_ms, id);
+    if (!result.changes) fail('Execution is already complete or was not found', 409);
+    return this.sequenceGetExecution({ id });
+  }
+  sequenceEvent(event) {
+    this.db.transaction(() => {
+      const inserted = this.db.prepare('INSERT OR IGNORE INTO sequence_events(execution_id,event_order,at_ms,type,block_id,details_json) VALUES(?,?,?,?,?,?)')
+        .run(event.execution_id, event.order, event.at_ms, event.type, event.block_id, JSON.stringify(event.details));
+      const execution = this.sequenceGetExecution({ id: event.execution_id });
+      const active = this.active();
+      if (inserted.changes && active && execution.mode === 'live' && active.session_id === execution.recording_session_id) {
+        this.event(active.id, event.at_ms, 'sequence_step', { sequence_name: execution.definition.name,
+          execution_id: event.execution_id, phase: event.type, block_id: event.block_id, ...event.details });
+      }
+    })();
+    return event;
+  }
+  sequenceGetExecution({ id }) {
+    const row = this.db.prepare('SELECT * FROM sequence_executions WHERE id=?').get(id);
+    if (!row) fail('Execution not found', 404);
+    const { definition_json, ...other } = row;
+    return { ...other, definition: JSON.parse(definition_json), completed_steps: this.db.prepare("SELECT COUNT(*) AS count FROM sequence_events WHERE execution_id=? AND type='block_completed'").get(id).count };
+  }
+  sequenceListExecutions({ controlOnly = false } = {}) {
+    if (controlOnly) {
+      return this.db.prepare(`
+        SELECT id, state FROM sequence_executions
+        WHERE state IN ('running', 'paused')
+          OR (mode='live' AND recovery_ms IS NULL AND reason IN ('command_outcome_unknown','bridge_restart'))
+        ORDER BY (state IN ('running', 'paused')) DESC, started_ms DESC, id
+        LIMIT 1
+      `).all();
+    }
+    return this.db.prepare("SELECT e.id,e.sequence_id,e.revision,json_extract(e.definition_json,'$.name') AS name,e.mode,e.device_id,e.state,e.reason,e.started_ms,e.ended_ms,e.recording_run_id,(SELECT COUNT(*) FROM sequence_events v WHERE v.execution_id=e.id AND v.type='block_completed') AS completed_steps FROM sequence_executions e ORDER BY e.started_ms DESC LIMIT 100").all();
+  }
+  sequenceEvents({ id, after = 0, limit = 100 }) {
+    const rows = this.db.prepare('SELECT event_order,at_ms,type,block_id,details_json FROM sequence_events WHERE execution_id=? AND event_order>? ORDER BY event_order LIMIT ?').all(id, integer(after, 0, 0, Number.MAX_SAFE_INTEGER), integer(limit, 100, 1, 200));
+    return rows.map(({ details_json, ...row }) => ({ ...row, details: JSON.parse(details_json) }));
+  }
+  sequenceUnsafeStatus() {
+    return this.db.prepare("SELECT COUNT(*) AS count FROM sequence_executions WHERE mode='live' AND recovery_ms IS NULL AND reason IN ('command_outcome_unknown','bridge_restart')").get().count > 0;
+  }
+  sequenceRecover({ id, now = Date.now() } = {}) {
+    const result = this.db.prepare("UPDATE sequence_executions SET recovery_ms=? WHERE id=? AND mode='live' AND recovery_ms IS NULL AND reason IN ('command_outcome_unknown','bridge_restart')").run(now, id);
+    if (result.changes !== 1) fail('Execution does not require recovery', 409);
+    return { recovered: true, id };
+  }
+  event(id, at, type, details) {
+    return Number(this.db.prepare('INSERT INTO events(run_id,at_ms,type,details_json) VALUES(?,?,?,?)')
+      .run(id, at, type, JSON.stringify(details)).lastInsertRowid);
+  }
+  insertRun({ name, device_id, remote_address, mode, source, at, metadata, previous = null, session = randomUUID() }) {
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO runs(id,session_id,name,device_id,remote_address,run_type,
+      current_mode,current_source,started_ms,contains_debug,previous_run_id,metadata_json)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, session, name, device_id, remote_address,
+      mode, mode, source, at, mode === 'debug' ? 1 : 0, previous, JSON.stringify(metadata));
+    return id;
+  }
+  start({ name, envelope, metadata = {}, now = Date.now() }) {
+    if (typeof name !== 'string' || !name.trim() || name.length > 120) fail('Run name must be 1–120 characters');
+    if (envelope?.source !== 'udp' || envelope.type !== 'telemetry') fail('A real UDP telemetry source is required', 409);
+    const mode = confirmedMode(envelope.packet);
+    if (!mode) fail('The packet does not report a supported recording mode', 409);
+    const run = this.db.transaction(() => {
+      if (this.active()) fail('Stop the current recording first', 409);
+      const id = this.insertRun({ name: name.trim(), device_id: envelope.packet.device_id,
+        remote_address: envelope.network.remote_address, mode, source: confirmedSource(envelope.packet), at: now, metadata });
+      this.event(id, now, 'run_started', { mode, source: confirmedSource(envelope.packet) });
+      return this.get(id);
+    })();
+    const uptime = envelope.packet.device_uptime_ms;
+    this.lastDeviceUptimeMs = Number.isSafeInteger(uptime) && uptime > 0 ? uptime : null;
+    return run;
+  }
+  finish(run, at, reason, status = 'completed', next = null, details = {}) {
+    this.db.prepare('UPDATE runs SET status=?,ended_ms=?,end_reason=?,next_run_id=? WHERE id=?')
+      .run(status, at, reason, next, run.id);
+    this.event(run.id, at, 'run_ended', { reason, next_run_id: next, ...details });
+  }
+  stop({ now = Date.now(), reason = 'operator_stop', status = 'completed' } = {}) {
+    const stopped = this.db.transaction(() => {
+      const active = this.active();
+      if (!active) fail('No recording is active', 409);
+      this.finish(active, now, reason, status);
+      return this.get(active.id);
+    })();
+    this.lastDeviceUptimeMs = null;
+    return stopped;
+  }
+  rotate(run, { mode, source, at, reason, details }) {
+    this.finish(run, at, reason, 'completed', null, details);
+    const next = this.insertRun({ name: run.name, device_id: run.device_id,
+      remote_address: run.remote_address, mode: mode ?? run.current_mode, source: source ?? run.current_source,
+      at, metadata: JSON.parse(run.metadata_json), previous: run.id, session: run.session_id });
+    this.db.prepare('UPDATE runs SET next_run_id=? WHERE id=?').run(next, run.id);
+    this.db.prepare("UPDATE events SET details_json=json_set(details_json,'$.next_run_id',?) WHERE id=(SELECT MAX(id) FROM events WHERE run_id=? AND type='run_ended')")
+      .run(next, run.id);
+    this.event(next, at, 'run_started', { reason, previous_run_id: run.id, ...details });
+    return this.active();
+  }
+  ingest({ envelope, rawBase64 }) {
+    if (envelope?.source !== 'udp' || envelope.type !== 'telemetry') return null;
+    const at = Date.parse(envelope.received_at);
+    if (!Number.isFinite(at)) fail('Invalid receive timestamp');
+    let acceptedUptime = null;
+    const result = this.db.transaction(() => {
+      let run = this.active();
+      if (!run) return null;
+      const p = envelope.packet;
+      if (p.device_id !== run.device_id || envelope.network?.remote_address !== run.remote_address) return null;
+      // Do not accidentally record cached/pre-start envelopes.
+      if (at < run.started_ms) return null;
+      const mode = confirmedMode(p), source = confirmedSource(p);
+      const uptime = Number.isSafeInteger(p.device_uptime_ms) && p.device_uptime_ms >= 0 ? p.device_uptime_ms : null;
+      const reboot = deviceReboot(run.last_seq, p.seq, this.lastDeviceUptimeMs, uptime);
+      const order = reboot ? 'forward' : packetOrder(run.last_seq, p.seq);
+      const forward = order !== 'duplicate' && order !== 'out_of_order';
+      if (forward) {
+        const details = { from_source: run.current_source, to_source: source,
+          from_mode: run.current_mode, to_mode: mode,
+          source_evidence: 'mppt_reg13', reg13: p.raw?.mppt?.reg13 ?? null };
+        if (reboot) {
+          Object.assign(details, { label: 'Device reboot detected', previous_seq: run.last_seq,
+            next_seq: p.seq, previous_uptime_ms: this.lastDeviceUptimeMs, next_uptime_ms: uptime });
+          this.event(run.id, at, 'device_reboot', details);
+          run = this.rotate(run, { mode, source, at, reason: 'device_reboot', details });
+        } else {
+          const change = transition(run, mode, source);
+          if (change.sourceChanged) {
+            details.label = `Power source switched from ${SOURCE_LABELS[run.current_source]} to ${SOURCE_LABELS[source]}`;
+            this.event(run.id, at, 'source_switch', details);
+          }
+          if (change.modeChanged) this.event(run.id, at, 'mode_changed', details);
+          if (change.rotate) run = this.rotate(run, { mode, source, at, reason: change.reason, details });
+        }
+        this.db.prepare(`UPDATE runs SET current_mode=?,current_source=?,contains_debug=MAX(contains_debug,?),last_seq=? WHERE id=?`)
+          .run(mode ?? run.current_mode, source ?? run.current_source, mode === 'debug' ? 1 : 0, p.seq ?? null, run.id);
+        if (uptime !== null) acceptedUptime = uptime;
+      }
+      const inserted = this.db.prepare(`INSERT INTO samples(run_id,received_ms,seq,mode,power_source,packet_order,envelope_json,raw_base64)
+        VALUES(?,?,?,?,?,?,?,?)`).run(run.id, at, p.seq ?? null, mode, source, order, JSON.stringify(envelope), rawBase64);
+      this.db.prepare('UPDATE runs SET sample_count=sample_count+1,last_received_ms=? WHERE id=?').run(at, run.id);
+      return { run_id: run.id, sample_id: Number(inserted.lastInsertRowid), mode, power_source: source };
+    })();
+    if (acceptedUptime !== null) this.lastDeviceUptimeMs = acceptedUptime;
+    return result;
+  }
+  command({ envelope }) {
+    const run = this.active();
+    if (!run || envelope.target?.address !== run.remote_address) return null;
+    this.event(run.id, Date.parse(envelope.updated_at), 'command_status', envelope);
+    return { run_id: run.id };
+  }
+  marker({ sequence_name, step_index, step_text, phase, ok = null, result = null, now = Date.now() }) {
+    const run = this.active();
+    if (!run) fail('No recording is active', 409);
+    if (typeof sequence_name !== 'string' || !sequence_name.trim() || sequence_name.length > 120) {
+      fail('Sequence name must be 1–120 characters');
+    }
+    if (!Number.isSafeInteger(step_index) || step_index < 0 || step_index > 100000) fail('Invalid sequence step index');
+    if (typeof step_text !== 'string' || !step_text.trim() || step_text.length > 500) fail('Sequence step must be 1–500 characters');
+    if (!['started', 'completed', 'failed'].includes(phase)) fail('Invalid sequence step phase');
+    if (ok !== null && typeof ok !== 'boolean') fail('Sequence step result must be true, false or null');
+    if (result !== null && typeof result !== 'string') fail('Sequence step output must be a string or null');
+    const details = { sequence_name: sequence_name.trim(), step_index, step_number: step_index + 1,
+      step_text: step_text.trim(), phase, ok, result: result === null ? null : result.slice(0, 1000) };
+    const event_id = this.event(run.id, integer(now, Date.now(), 0, Number.MAX_SAFE_INTEGER), 'sequence_step', details);
+    return { run_id: run.id, event_id, ...details };
+  }
+  get(id) {
+    const row = this.db.prepare('SELECT * FROM runs WHERE id=?').get(id);
+    if (!row) fail('Run not found', 404);
+    const { metadata_json, ...rest } = row;
+    return { ...rest, metadata: JSON.parse(metadata_json) };
+  }
+  list({ limit, offset } = {}) {
+    return this.db.prepare('SELECT id FROM runs ORDER BY started_ms DESC,id DESC LIMIT ? OFFSET ?')
+      .all(integer(limit, 50, 1, 100), integer(offset, 0, 0, 1000000)).map((r) => this.get(r.id));
+  }
+  window(id, options) {
+    const run = this.get(id);
+    const start = integer(options.start, run.started_ms, 0, Number.MAX_SAFE_INTEGER);
+    // IDs disambiguate samples sharing a millisecond with a boundary/stop marker.
+    const defaultEnd = Math.max(run.ended_ms ?? Date.now() + 1, (run.last_received_ms ?? run.started_ms) + 1);
+    const end = integer(options.end, defaultEnd, 0, Number.MAX_SAFE_INTEGER);
+    if (end < start) fail('end must not precede start');
+    return { start, end };
+  }
+  samples({ id, ...options }) {
+    const { start, end } = this.window(id, options);
+    const after = integer(options.after, 0, 0, Number.MAX_SAFE_INTEGER);
+    const limit = integer(options.limit, 100, 1, 500);
+    const rows = this.db.prepare(`SELECT * FROM samples WHERE run_id=? AND received_ms>=? AND received_ms<? AND id>?
+      ORDER BY id LIMIT ?`).all(id, start, end, after, limit + 1);
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map(({ envelope_json, ...r }) => ({ ...r, envelope: JSON.parse(envelope_json) }));
+    return { start, end, items, next_after: hasMore ? items.at(-1).id : null };
+  }
+  events({ id, after, limit }) {
+    this.get(id);
+    const rows = this.db.prepare('SELECT * FROM events WHERE run_id=? AND id>? ORDER BY id LIMIT ?')
+      .all(id, integer(after, 0, 0, Number.MAX_SAFE_INTEGER), integer(limit, 100, 1, 500) + 1);
+    const size = integer(limit, 100, 1, 500);
+    const items = rows.slice(0, size).map(({ details_json, ...r }) => ({ ...r, details: JSON.parse(details_json) }));
+    return { items, next_after: rows.length > size ? items.at(-1).id : null };
+  }
+  series({ id, metric, ...options }) {
+    if (!Object.hasOwn(METRICS, metric)) fail('Unknown metric');
+    const { start, end } = this.window(id, options);
+    if (end - start > 24 * 60 * 60 * 1000) fail('Series queries are limited to 24 hours');
+    const points = integer(options.points, 500, 1, 2000);
+    const width = Math.max(1, Math.ceil((end - start) / points));
+    // JSON path is a bound, allowlisted parameter. No browser-provided SQL or identifiers.
+    const rows = this.db.prepare(`WITH values_in_window AS (
+      SELECT id,received_ms,json_extract(envelope_json,?) AS value FROM samples
+      WHERE run_id=? AND received_ms>=? AND received_ms<?
+    ) SELECT CAST((received_ms-?)/? AS INTEGER) AS bucket,COUNT(*) AS sample_count,
+      COUNT(CASE WHEN typeof(value) IN ('integer','real') THEN value END) AS valid_count,
+      MIN(CASE WHEN typeof(value) IN ('integer','real') THEN value END) AS min,
+      MAX(CASE WHEN typeof(value) IN ('integer','real') THEN value END) AS max,
+      AVG(CASE WHEN typeof(value) IN ('integer','real') THEN value END) AS mean,
+      MIN(id) AS first_sample_id,MAX(id) AS last_sample_id
+      FROM values_in_window GROUP BY bucket ORDER BY bucket`)
+      .all(METRICS[metric], id, start, end, start, width);
+    return { metric, start, end, bucket_ms: width, points: rows.map(({ bucket, ...r }) => ({
+      start_ms: start + bucket * width, end_ms: Math.min(end, start + (bucket + 1) * width), ...r
+    })) };
+  }
+  close() {
+    this.db.prepare('DELETE FROM recorder_owner WHERE token=?').run(this.ownerId);
+    this.db.close();
+  }
+}

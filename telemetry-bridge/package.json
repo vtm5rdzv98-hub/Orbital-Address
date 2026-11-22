@@ -1,0 +1,16 @@
+{
+  "name": "cubesat-telemetry-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1"
+  },
+  "engines": {
+    "node": "20.x || 22.x || 23.x || 24.x || 25.x"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.8.0",
+    "jose": "6.1.3",
+    "nodemailer": "10.6.0"
+  }
+}
