@@ -36,6 +36,8 @@ The platform is designed around a physical engineering prototype, **not a flight
 
 The included demonstration runs the actual browser application and Node.js bridge, with a **local UDP device simulator** standing in for the ESP32. No CubeSat, DigitalOcean account, or production credentials are needed.
 
+The demo launcher prepares the pinned Three.js r176 browser runtime on first use (`npm` registry access is required for that initial preparation).
+
 **Requirements:** Node.js 22 or 24, npm, and Bash. On Windows, use a Bash-compatible environment.
 
 ```bash
